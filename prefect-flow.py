@@ -19,6 +19,7 @@ Use Prefect's logger (get_run_logger) for logging. Never hard-code your
 computing ID or the endpoint: read them from the environment (.env).
 """
 import os
+import subprocess
 import time
 from datetime import datetime, timezone
 
@@ -134,15 +135,27 @@ def collect_messages(queue_url: str, expected: int = 21, timeout_s: int = 300) -
 @task
 def dbt_build() -> None:
     """Run `dbt build --project-dir dbt --profiles-dir dbt`; raise if anything fails."""
-    # TODO (Checkpoint C)
-    raise NotImplementedError
+    # (Checkpoint C)
+    logger = get_run_logger()  
+    result = subprocess.run( # creates a subprocess which allows us to run dbt build command in the shell
+        ["dbt", "build", "--project-dir", "dbt", "--profiles-dir", "dbt"],   
+        capture_output=True, text=True,
+    )
+    logger.info(result.stdout) # shows dbt output in prefect logs
+    if result.returncode != 0: # failed test or model stops the flow before submission
+        raise RuntimeError("dbt build failed, not submitting")
 
 
 @task
 def read_phrase() -> str:
     """Read the phrase from the dbt mart model in DuckDB."""
-    # TODO (Checkpoint C)
-    raise NotImplementedError
+    # (Checkpoint C)
+    logger = get_run_logger()
+    con = duckdb.connect(DUCKDB_PATH, read_only=True)
+    phrase = con.execute("SELECT phrase FROM main.assembled_phrase").fetchone()[0] # fetchone() returns a tuple, we want the first element which is the phrase
+    con.close()
+    logger.info(f"Phrase: {phrase}")
+    return phrase
 
 
 @task
@@ -157,7 +170,9 @@ def dp2_pipeline():
     queue_url = populate_queue()
     monitor_queue(queue_url)
     collect_messages(queue_url)
-    # TODO (Lesson 10): dbt_build -> read_phrase -> submit_solution
+    dbt_build()
+    phrase = read_phrase()
+    # TODO (Lesson 10): submit_solution
 
 
 if __name__ == "__main__":
