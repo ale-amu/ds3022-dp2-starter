@@ -106,7 +106,8 @@ def collect_messages(queue_url: str, expected: int = 21, timeout_s: int = 300) -
     con.execute("CREATE TABLE IF NOT EXISTS raw.fragments (order_no VARCHAR, word VARCHAR, received_at TIMESTAMP)") # varchar means variable length string, timestamp is date and time
 
     stored = 0
-    while stored < expected:
+    # store all 21 then make sure queue is empty 
+    while stored < expected or sum(get_counts(queue_url).values()) > 0:
         if time.time() - start > timeout_s: # if timeout is exceeded, it fail 
             con.close()
             raise TimeoutError(f"Timeout exceeded: only {stored}/{expected} fragments stored after {timeout_s} seconds")
@@ -118,10 +119,15 @@ def collect_messages(queue_url: str, expected: int = 21, timeout_s: int = 300) -
             MessageAttributeNames=["All"], # allows us to get the message attributes (order_no and word) from the messages
         )
         for msg in resp.get("Messages", []): # no 'Messages' key when nothing is visible
-            order_no = msg["MessageAttributes"]["order_no"]["StringValue"]
-            word = msg["MessageAttributes"]["word"]["StringValue"]
-            # first store fragment, then delete the message 
-            con.execute("INSERT INTO raw.fragments VALUES (?, ?, ?)", [order_no, word, datetime.now(timezone.utc)])
+            attrs = msg.get("MessageAttributes", {})
+            order_no = attrs.get("order_no", {}).get("StringValue")
+            word = attrs.get("word", {}).get("StringValue")
+            if order_no is None or word is None or not order_no.isdigit():
+                # malformed message: log it and delete it, but do not store it
+                logger.warning(f"Malformed message, deleting it: {attrs}")
+            else:
+                # first store fragment, then delete the message 
+                con.execute("INSERT INTO raw.fragments VALUES (?, ?, ?)", [order_no, word, datetime.now(timezone.utc)])
             sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
 
         stored = con.execute("SELECT count(DISTINCT order_no) FROM raw.fragments").fetchone()[0]
