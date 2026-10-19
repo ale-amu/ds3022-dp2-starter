@@ -20,11 +20,13 @@ computing ID or the endpoint: read them from the environment (.env).
 """
 import os
 import time
+from datetime import datetime, timezone
 
 import boto3
 import requests
 from dotenv import load_dotenv
 from prefect import flow, task, get_run_logger
+import duckdb
 
 load_dotenv()
 
@@ -34,6 +36,8 @@ DUCKDB_PATH = os.environ.get("DP2_DUCKDB", "dp2.duckdb")
 
 sqs = boto3.client("sqs")  # the endpoint comes from AWS_ENDPOINT_URL_SQS
 
+
+#populate queue asks scatter api to populate the queue and returns the queue URL as a string
 
 @task #marks fucntion as a prefect task so its its own step
 def populate_queue() -> str: #fuction that returns queue URL as a string
@@ -66,6 +70,7 @@ def get_counts(queue_url: str) -> dict:
     }
     return counts
 
+#keep checking queue counts every poll_s seconds until there are no delayed messages, or raise a TimeoutError if timeout_s is exceeded
 
 @task
 def monitor_queue(queue_url: str, poll_s: int = 5, timeout_s: int = 1200) -> dict: 
@@ -84,11 +89,46 @@ def monitor_queue(queue_url: str, poll_s: int = 5, timeout_s: int = 1200) -> dic
     return counts
 
 
+# pick up each message, save its number and word in duckdb then delete from queue. save before so its not lost
+
 @task
-def collect_messages(queue_url: str, expected: int = 21) -> int:
+def collect_messages(queue_url: str, expected: int = 21, timeout_s: int = 300) -> int:
     """Receive, land in DuckDB, then delete. Return how many fragments are stored."""
-    # TODO (Checkpoint B): MessageAttributeNames=["All"] and resp.get("Messages", [])
-    raise NotImplementedError
+    # (Checkpoint B): MessageAttributeNames=["All"] and resp.get("Messages", [])
+    logger = get_run_logger() # create a log for tracking messages
+    logger.info(f"Collecting messages from queue: {queue_url}")
+    #collect messages recieves until 21 fragmenst stored
+    start = time.time() # tracks the start time of collecting
+
+    con = duckdb.connect(DUCKDB_PATH)
+    con.execute("CREATE SCHEMA IF NOT EXISTS raw")
+    con.execute("CREATE TABLE IF NOT EXISTS raw.fragments (order_no VARCHAR, word VARCHAR, received_at TIMESTAMP)") # varchar means variable length string, timestamp is date and time
+
+    stored = 0
+    while stored < expected:
+        if time.time() - start > timeout_s: # if timeout is exceeded, it fail 
+            con.close()
+            raise TimeoutError(f"Timeout exceeded: only {stored}/{expected} fragments stored after {timeout_s} seconds")
+
+        resp = sqs.receive_message( # receive messages from the queue
+            QueueUrl=queue_url,     
+            MaxNumberOfMessages=10, 
+            WaitTimeSeconds=10,
+            MessageAttributeNames=["All"], # allows us to get the message attributes (order_no and word) from the messages
+        )
+        for msg in resp.get("Messages", []): # no 'Messages' key when nothing is visible
+            order_no = msg["MessageAttributes"]["order_no"]["StringValue"]
+            word = msg["MessageAttributes"]["word"]["StringValue"]
+            # first store fragment, then delete the message 
+            con.execute("INSERT INTO raw.fragments VALUES (?, ?, ?)", [order_no, word, datetime.now(timezone.utc)])
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+
+        stored = con.execute("SELECT count(DISTINCT order_no) FROM raw.fragments").fetchone()[0]
+        logger.info(f"Stored {stored}/{expected} fragments")
+
+    con.close() 
+    logger.info(f"Final queue counts: {get_counts(queue_url)}") 
+    return stored
 
 
 @task
@@ -116,7 +156,8 @@ def submit_solution(phrase: str, platform: str = "prefect") -> int:
 def dp2_pipeline():
     queue_url = populate_queue()
     monitor_queue(queue_url)
-    # TODO (Lesson 10): collect_messages -> dbt_build -> read_phrase -> submit_solution
+    collect_messages(queue_url)
+    # TODO (Lesson 10): dbt_build -> read_phrase -> submit_solution
 
 
 if __name__ == "__main__":
