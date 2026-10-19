@@ -161,8 +161,23 @@ def read_phrase() -> str:
 @task
 def submit_solution(phrase: str, platform: str = "prefect") -> int:
     """Send to dp2-submit with uvaid / phrase / platform attributes. Return the HTTP status code."""
-    # TODO (Checkpoint D)
-    raise NotImplementedError
+    # (Checkpoint D)
+    logger = get_run_logger()
+    url = sqs.get_queue_url(QueueName="dp2-submit")["QueueUrl"]
+    response = sqs.send_message(
+        QueueUrl=url,
+        MessageBody="dp2 solution",
+        MessageAttributes={
+            "uvaid":    {"DataType": "String", "StringValue": UVA_ID},
+            "phrase":   {"DataType": "String", "StringValue": phrase},
+            "platform": {"DataType": "String", "StringValue": platform},
+        },
+    )
+    status = response["ResponseMetadata"]["HTTPStatusCode"]
+    logger.info(f"Submission HTTP status: {status}")
+    if status != 200: # makes the run fail if submission was not accepted
+        raise RuntimeError(f"Submission failed with HTTP status {status}")
+    return status
 
 
 @flow(name="dp2-pipeline", log_prints=True)
@@ -172,7 +187,7 @@ def dp2_pipeline():
     collect_messages(queue_url)
     dbt_build()
     phrase = read_phrase()
-    # TODO (Lesson 10): submit_solution
+    submit_solution(phrase)
 
 
 if __name__ == "__main__":
