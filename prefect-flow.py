@@ -35,25 +35,53 @@ DUCKDB_PATH = os.environ.get("DP2_DUCKDB", "dp2.duckdb")
 sqs = boto3.client("sqs")  # the endpoint comes from AWS_ENDPOINT_URL_SQS
 
 
-@task
-def populate_queue() -> str:
+@task #marks fucntion as a prefect task so its its own step
+def populate_queue() -> str: #fuction that returns queue URL as a string
     """POST to the scatter API and return your queue URL."""
-    logger = get_run_logger()
-    # TODO (Checkpoint A)
-    raise NotImplementedError
+    logger = get_run_logger() 
+    # (Checkpoint A) 
+    url = SCATTER_URL
+    payload= requests.post(url).json() # sends https post request to scatter api
+    queue_url = payload["sqs_url"] # this is the queue URL returned by the scatter API
+    logger.info(f"Queue URL: {queue_url}")
+    return queue_url
 
+
+#asks code how many messages are in the queue, how many are not visible, and how many are delayed
 
 def get_counts(queue_url: str) -> dict:
     """Plain helper (not a task): return the three ApproximateNumberOf... counters as integers."""
-    # TODO (Checkpoint A)
-    raise NotImplementedError
+    # (Checkpoint A)
+    url = queue_url # the queue URL returned by the scatter API
+    response = sqs.get_queue_attributes(
+        QueueUrl=url,
+        AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible", "ApproximateNumberOfMessagesDelayed"]   
+    ) # the 3 counters we want to get from the queue
+
+    attrs = response["Attributes"] 
+    counts = {
+        "visible": int(attrs.get("ApproximateNumberOfMessages", 0)), 
+        "not_visible": int(attrs.get("ApproximateNumberOfMessagesNotVisible", 0)),
+        "delayed": int(attrs.get("ApproximateNumberOfMessagesDelayed", 0))
+    }
+    return counts
 
 
 @task
-def monitor_queue(queue_url: str, poll_s: int = 5, timeout_s: int = 1200) -> dict:
+def monitor_queue(queue_url: str, poll_s: int = 5, timeout_s: int = 1200) -> dict: 
     """Log the three counters every poll_s seconds until nothing is delayed; raise after timeout_s."""
-    # TODO (Checkpoint A)
-    raise NotImplementedError
+    # (Checkpoint A)
+    logger = get_run_logger()
+    start= time.time() # tracks the start time of the monitoring
+    while True:
+        counts = get_counts(queue_url) # get the counts of the queue
+        logger.info(f"Queue counts: {counts}") # log the counts
+        if counts["delayed"] == 0: # if there are no delayed messages, break the loop
+            break
+        if time.time() - start > timeout_s: # if the timeout is exceeded, raise an error
+            raise TimeoutError(f"Timeout exceeded: {timeout_s} seconds")
+        time.sleep(poll_s) # wait for poll_s seconds before checking again
+    return counts
 
 
 @task
