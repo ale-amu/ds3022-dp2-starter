@@ -159,3 +159,153 @@ You may observe and rerun your pipeline as often as you like, but in the end you
 - [Prefect documentation](https://docs.prefect.io/v3/get-started)
 - [dbt-duckdb adapter](https://github.com/duckdb/dbt-duckdb) and [dbt data tests](https://docs.getdbt.com/docs/build/data-tests)
 - [Moto server mode](https://docs.getmoto.org/en/latest/docs/server_mode.html), [ElasticMQ](https://github.com/softwaremill/elasticmq)
+
+---
+
+# My Solution
+
+## Rubric 4.1: Setup and run instructions that work from a fresh clone (emulator, scatter API, `.env`, run command)
+
+1. **Setting up Python environment** (Python 3.12 or 3.13):
+
+***set up a virtual environment***
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   cp .env.example .env
+   ```
+
+1b.  set `UVA_ID` to my computing ID.
+
+2. **Start the 3 servers**, each in its own terminal with a venv:
+   ```bash
+   moto_server -p 9324            # T1: emulator
+   python kit/scatter_api.py      # T2: scatter API
+   prefect config set PREFECT_API_URL="http://127.0.0.1:4200/api"
+   prefect server start           # T4: prefect dashboard (port: http://127.0.0.1:4200)
+   ```
+3. **emulator: `python kit/smoke_test.py`** should print `Emulator OK`.
+
+4. **Run  pipeline** (in T3: work terminal after setting up venv):
+   ```bash
+   python prefect-flow.py
+   python kit/check_submission.py
+   ```
+
+- one command runs the whole pipeline, `check_submission.py`, then prints `PASS` and a receipt code
+
+- **fast mode:** set `DP2_FAST=1` (because its messages are delayed 5-60 s, and a run takes about 1 minute).
+- **full-delay mode:** set `DP2_FAST=0` (its messages are delayed 30-900 s, and a run takes up to 15 minutes).
+- **chaos mode:** set `DP2_CHAOS=1` (adds 2 duplicate messages and 1 malformed message).
+
+after changing either setting, restart scatter API in T2, then `python kit/scatter_api.py`
+
+## Rubric 4.2: Architecture / DAG diagram with task boundaries and dependencies
+
+![DAG](docs/dag.jpg)
+
+The DAG diagram depicts a flow that runs 6 tasks in order: `populate_queue -> monitor_queue -> collect_messages -> dbt_build -> read_phrase -> submit_solution`
+
+## Rubric 4.3: Polling strategy justified: what you chose, why, and what you rejected
+
+I chose to have `monitor_queue` check queue counts every 5 seconds (`poll_s=5`). Each check then calls `get_counts`, which is a function that asks how many messages are in the queue (also asks how many are not visible, and how many are delayed (`get_queue_attributes`)), and logs all three counters. The flows keep going until delayed hits 0, which means every message has come out of hiding. If this takes longer than 1200 seconds (`timeout_s`), a TimeoutError is raised so the run fails instead of hanging.
+
+I chose this because:
+- The delays are random (can take up to 900 seconds in full mode), so its difficult to just wait a fixed time.
+- So by checking the counters, we know exactly how many messages are still hidden.
+- 5 seconds is often enough to see progress in the logs without the emulator getting spammed.
+- Also, 1200 seconds is longer than the 900 s maximum delay, so a normal run won't time out, however a broken run also won't hang forever.
+
+I rejected two other options:
+- I decided not to just wait a fixed 15 minutes before collecting, because in fast mode I'd then have to wait 15 minutes for messages that would be ready in about 60 seconds. 
+- I also rejected polling every second because I found it would flood the logs without much to gain from it, and polling every 60 seconds because it could add up to a minute of delay at the end.
+
+## Rubric 4.4: Receive → persist → delete order and idempotency explained (what happens if the flow crashes between steps)
+
+For each message, my pipeline does these 3 steps :
+
+1. **Receive** first it receives the message from the queue, asks for the associated order number and the word. If nothing is ready yet, it just keeps asking again instead of instantly crashing.
+2. **Persist**: the second step is persist, which saves the order number and word in DuckDB.
+3. **Delete** lastly, the message is deleted from the queue.
+
+This order matters because a message will only be deleted after its word is safely saved this makes sure that if a message is repeated because the pipeline crashes after saving but the word hasn't been deleted yet, the repeat is harmless because dbt will remove duplicates. If I deleted first and the pipeline crashed before saving, that word would be lost for good and the phrase could never be finished. 
+
+If the pipeline is run again, every run gets the same 21 words, and dbt removes repeats, so running it again always gives the same phrase. 
+
+The pipeline keeps going until all 21 words are saved and the queue is empty. However, if this isn't done after about 300 seconds, it stops with an error however it does tell you how many words it got before the crash.
+
+## Rubric 3.5 and 3.6: Gate wired into the flow: a failed `dbt build` stops the flow before submission; Proved the tests can fail: evidence of a test failing on purpose and then passing
+
+dbt is the check that runs before we submit anything. during its check, it first cleans the fragments by turning order numbers into real numbers so they sort correctly, it also trims extra spaces/gaps from the words, and removes any duplicate fragment that was stored twice.
+
+dbt tests that:
+
+- every fragment has an order number and a word
+- no order number appears twice
+- there are exactly 21 fragments with no gaps
+
+All tests must pass before dbt builds the final phrase. If a test fails, the flow stops and nothing will be submitted, so it is important to make sure that a wrong or incomplete phrase is never sent.
+
+To prove the specified tests work, I deleted fragment 5 from the database which led to the "21 fragments, no gaps" test failing, because of this failure, the phrase was not built:
+
+![dbt fail](docs/checkpointC_dbt-fail.png)
+
+However, after putting the fragment back, all the tests passed again:
+
+![dbt pass](docs/checkpointC_dbt-pass.png)
+
+## Rubric 4.6: Tool roles: what Prefect, dbt and DuckDB each do in this pipeline, and what you would lose by dropping one
+
+| Tool | What it does in my pipeline | What I would lose without it |
+|---|---|---|
+| **Prefect** | Runs the six steps (as seen in DAG diagram) in order, shows every step and its logs in the dashboard, and marks the run as failed if any step breaks. | I couldn't easily see what ran, where it failed or why, and there would be no history of past runs. |
+| **DuckDB** | Saves each fragment as soon as it is received, before its message is deleted. dbt reads from the same database. | The fragments would only exist in memory, so a crash after deleting messages would lose them, and dbt would have nothing to work with. |
+| **dbt** | Cleans the fragments, tests that all 21 are there with no gaps or repeats, and builds the phrase. | The phrase would be put together with no checks, so a missing or repeated word could be submitted without anyone noticing. |
+
+## Rubric 4.5: "Chaos round" section: what broke, why, and how you fixed it
+
+Chaos mode adds 2 repeated messages and 1 broken message (no word, and "?" as its order number).
+
+During the first chaos run, the broken message caused a crash, because my code was written to expect every message to have a word. As a result, 14 messages were left in the queue.
+
+This happened because my code failed to expect that a queue can repeat messages and contain bad ones, hence it was written with the assumption that every message would be correct and arrive in the queue only once.
+
+To fix this, i logged broken messages and deleted these after. The code now ensures that repeats are only counted once, and makes sure that dbt removes them. Lastly, the pipeline collects all messages until the queue is empty, to make sure nothing is left out.
+
+After the fix, I was able to run 2 chaos runs consecutively that passed, and the queue was empty at the end:
+
+```
+WARNING | Malformed message, deleting it: {'order_no': {'StringValue': '?', 'DataType': 'String'}}
+INFO    | Final queue counts: {'visible': 0, 'not_visible': 0, 'delayed': 0}
+PASS  aez6aq / prefect  receipt: FBE5E338AB      (chaos run 1)
+PASS  aez6aq / prefect  receipt: FBE5E338AB      (chaos run 2)
+```
+
+
+## Rubric 2.4: Full-delay evidence run (`DP2_FAST=0`, 30-900 s) completed end to end
+
+I ran the pipeline once with the real delays (30 to 900 seconds per message). It finished on its own in 14 minutes 27 seconds: it waited until all 21 messages were visible, collected and saved them, passed all the dbt tests and submitted the phrase successfully.
+
+![Full-delay run](docs/checkpointF_full-delay-run.png)
+
+```
+Stored 21/21 fragments
+Final queue counts: {'visible': 0, 'not_visible': 0, 'delayed': 0}
+Done. PASS=6 WARN=0 ERROR=0 SKIP=0 NO-OP=0 REUSED=0 TOTAL=6
+Submission HTTP status: 200
+Flow run 'beautiful-manatee' - Finished in state Completed()
+PASS  aez6aq / prefect  receipt: FBE5E338AB
+```
+
+## Rubric 4.7: Results shown: dashboard screenshot, dbt output, receipt code
+
+A completed run in fast mode, shown in the Prefect dashboard:
+
+![Prefect run](docs/checkpointA_prefect-run.png)
+
+## Rubric 1.7: Correct answer: `check_submission.py` PASS; receipt code in the README is valid
+
+```
+PASS  aez6aq / prefect  receipt: FBE5E338AB
+```
