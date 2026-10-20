@@ -104,6 +104,7 @@ def collect_messages(queue_url: str, expected: int = 21, timeout_s: int = 300) -
     con = duckdb.connect(DUCKDB_PATH)
     con.execute("CREATE SCHEMA IF NOT EXISTS raw")
     con.execute("CREATE TABLE IF NOT EXISTS raw.fragments (order_no VARCHAR, word VARCHAR, received_at TIMESTAMP)") # varchar means variable length string, timestamp is date and time
+    con.execute("DELETE FROM raw.fragments") # every run starts with an empty table
 
     stored = 0
     # store all 21 then make sure queue is empty 

@@ -231,7 +231,7 @@ For each message, my pipeline does these 3 steps :
 
 This order matters because a message will only be deleted after its word is safely saved this makes sure that if a message is repeated because the pipeline crashes after saving but the word hasn't been deleted yet, the repeat is harmless because dbt will remove duplicates. If I deleted first and the pipeline crashed before saving, that word would be lost for good and the phrase could never be finished. 
 
-If the pipeline is run again, every run gets the same 21 words, and dbt removes repeats, so running it again always gives the same phrase. 
+Every run first starts with the table being emptied, so if the pipeline is run again, every run gets the same 21 words, and dbt removes repeats, so running it again will always give the same phrase. 
 
 The pipeline keeps going until all 21 words are saved and the queue is empty. However, if this isn't done after about 300 seconds, it stops with an error however it does tell you how many words it got before the crash.
 
